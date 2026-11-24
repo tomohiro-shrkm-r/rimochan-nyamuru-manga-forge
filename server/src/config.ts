@@ -4,9 +4,11 @@ export const REPO_ROOT = path.resolve(import.meta.dirname, "..", "..");
 export const OUT_ROOT = path.join(REPO_ROOT, "out");
 export const STYLES_DIR = path.join(REPO_ROOT, "styles");
 
-// Windows では System32 の bash.exe が WSL なので使わない。Git Bash を明示する
+// Windows では System32 の bash.exe が WSL なので使わない。Git Bash を明示する。
+// それ以外の OS では PATH 上の bash を使う
 export const BASH_PATH =
-  process.env.BASH_PATH ?? "C:\\Program Files\\Git\\bin\\bash.exe";
+  process.env.BASH_PATH ??
+  (process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : "bash");
 
 export const HOST = "127.0.0.1";
 export const PORT = Number(process.env.PORT ?? 8787);

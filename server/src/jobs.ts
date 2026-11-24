@@ -1,6 +1,13 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { BASH_PATH, OUT_ROOT, REPO_ROOT } from "./config.js";
 
@@ -28,8 +35,29 @@ export const isJobId = (s: string): boolean => JOB_ID.test(s);
 export const jobDir = (id: string): string => path.join(OUT_ROOT, id);
 const recordPath = (id: string): string => path.join(jobDir(id), "job.json");
 
-export const writeRecord = (r: JobRecord): Promise<void> =>
-  writeFile(recordPath(r.id), JSON.stringify(r, null, 2), "utf8");
+const RENAME_RETRYABLE: ReadonlySet<string> = new Set(["EPERM", "EACCES", "EBUSY"]);
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Windows では、相手が読んでいる最中のファイルへの rename が EPERM 等で失敗するので少し待って再試行する */
+const renameWithRetry = async (from: string, to: string): Promise<void> => {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await rename(from, to);
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code ?? "";
+      if (attempt >= 20 || !RENAME_RETRYABLE.has(code)) throw e;
+      await sleep(10 * (attempt + 1));
+    }
+  }
+};
+
+/** 一時ファイルに書いてから rename する。読み手が書きかけの JSON を見ないようにするため */
+export const writeRecord = async (r: JobRecord): Promise<void> => {
+  const tmp = `${recordPath(r.id)}.${randomUUID()}.tmp`;
+  await writeFile(tmp, JSON.stringify(r, null, 2), "utf8");
+  await renameWithRetry(tmp, recordPath(r.id));
+};
 
 export const readRecord = async (id: string): Promise<JobRecord | undefined> => {
   try {
@@ -110,10 +138,32 @@ const execute = async (id: string, input: JobInput): Promise<void> => {
   }
 };
 
-// codex のレート制限対策で1件ずつ直列に実行する
+/** execute が想定外に失敗したとき、ジョブを failed にする（これ自体は例外を投げない） */
+const markFailed = async (id: string, e: unknown): Promise<void> => {
+  const message = e instanceof Error ? e.message : String(e);
+  console.error(`ジョブ ${id} の実行で想定外のエラー:`, e);
+  try {
+    const base = await readRecord(id);
+    if (base) {
+      await writeRecord({
+        ...base,
+        status: "failed",
+        finishedAt: new Date().toISOString(),
+        error: `内部エラー: ${message}`,
+      });
+    }
+  } catch (inner) {
+    console.error(`ジョブ ${id} を failed に更新できない:`, inner);
+  }
+};
+
+// codex のレート制限対策で1件ずつ直列に実行する。
+// 1件が例外を投げてもキューが rejected のまま固まらないよう、必ず catch で受ける
 let queue: Promise<void> = Promise.resolve();
 export const enqueue = (id: string, input: JobInput): void => {
-  queue = queue.then(() => execute(id, input));
+  queue = queue
+    .then(() => execute(id, input))
+    .catch((e: unknown) => markFailed(id, e));
 };
 
 /** 再起動で途中になったジョブを failed にする */
