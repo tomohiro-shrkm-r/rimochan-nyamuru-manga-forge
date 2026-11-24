@@ -1,13 +1,13 @@
 import { serve } from "@hono/node-server";
+import { swaggerUI } from "@hono/swagger-ui";
+import { OpenAPIHono, type z } from "@hono/zod-openapi";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { Hono } from "hono";
 import { HOST, LIMITS, OUT_ROOT, PORT, REF_EXTENSIONS } from "./config.js";
 import {
   createJob,
   enqueue,
   failStaleJobs,
-  isJobId,
   jobDir,
   pageFile,
   readProgress,
@@ -15,25 +15,16 @@ import {
   writeRecord,
   type JobInput,
 } from "./jobs.js";
+import {
+  createJobRoute,
+  getJobRoute,
+  getPageRoute,
+  listStylesRoute,
+  type CreateJobForm,
+} from "./routes.js";
 import { listStyles } from "./styles.js";
 
 class BadRequest extends Error {}
-
-const asFile = (v: FormDataEntryValue | null): File | undefined =>
-  v instanceof File && v.size > 0 ? v : undefined;
-
-const asText = (v: FormDataEntryValue | null): string | undefined =>
-  typeof v === "string" && v !== "" ? v : undefined;
-
-const parsePages = (v: FormDataEntryValue | null): number | undefined => {
-  const s = asText(v);
-  if (s === undefined) return undefined;
-  const n = Number(s);
-  if (!Number.isInteger(n) || n < 1 || n > LIMITS.maxPages) {
-    throw new BadRequest(`pages は 1〜${LIMITS.maxPages} の整数`);
-  }
-  return n;
-};
 
 const refExtension = (f: File): string => {
   const ext = path.extname(f.name).toLowerCase();
@@ -46,32 +37,30 @@ const refExtension = (f: File): string => {
   return ext;
 };
 
-/** multipart を検証し、input/ にファイルを保存して JobInput を返す */
-const parseInput = async (form: FormData, id: string): Promise<JobInput> => {
-  const omnyField = form.get("omny");
-  const omnyText =
-    typeof omnyField === "string" ? omnyField : await asFile(omnyField)?.text();
-  if (!omnyText?.trim()) throw new BadRequest("omny（YAML本文またはファイル）は必須");
+const toArray = <T>(v: T | readonly T[] | undefined): readonly T[] =>
+  v === undefined ? [] : Array.isArray(v) ? v : [v as T];
+
+/** zod 検証済みのフォームに、サイズ・拡張子などの追加検証をして input/ に保存する */
+const saveInput = async (
+  form: z.infer<typeof CreateJobForm>,
+  id: string,
+): Promise<JobInput> => {
+  const omnyText = typeof form.omny === "string" ? form.omny : await form.omny.text();
+  if (!omnyText.trim()) throw new BadRequest("omny（YAML本文またはファイル）は必須");
   if (Buffer.byteLength(omnyText) > LIMITS.omnyBytes) {
     throw new BadRequest(`omny が大きすぎる（上限 ${LIMITS.omnyBytes} bytes）`);
   }
 
-  const memo = asText(form.get("memo"));
-  if (memo && memo.length > LIMITS.memoChars) {
-    throw new BadRequest(`memo は ${LIMITS.memoChars} 文字まで`);
-  }
-
-  const style = asText(form.get("style"));
+  const style = form.style || undefined;
   if (style && !(await listStyles()).some((s) => s.id === style)) {
     throw new BadRequest(`style が存在しない: ${style}（GET /styles で一覧）`);
   }
 
-  const refs = form.getAll("refs").flatMap((v) => asFile(v) ?? []);
+  const refs = toArray(form.refs).filter((f) => f.size > 0);
   if (refs.length > LIMITS.refCount) {
     throw new BadRequest(`refs は最大 ${LIMITS.refCount} 枚`);
   }
   const exts = refs.map(refExtension);
-  const pages = parsePages(form.get("pages"));
 
   const dir = path.join(jobDir(id), "input");
   const omnyPath = path.join(dir, "input.omny.yaml");
@@ -84,20 +73,33 @@ const parseInput = async (form: FormData, id: string): Promise<JobInput> => {
     }),
   );
 
-  return { omnyPath, refPaths, style, memo, pages };
+  return {
+    omnyPath,
+    refPaths,
+    style,
+    memo: form.memo || undefined,
+    pages: form.pages,
+  };
 };
 
-const app = new Hono();
+const app = new OpenAPIHono({
+  // zod の検証エラーも { error } の形に揃える
+  defaultHook: (result, c) => {
+    if (result.success) return;
+    const msg = result.error.issues
+      .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+      .join("; ");
+    return c.json({ error: msg }, 400);
+  },
+});
 
-app.get("/styles", async (c) => c.json(await listStyles()));
+app.openapi(listStylesRoute, async (c) => c.json([...(await listStyles())], 200));
 
-app.post("/jobs", async (c) => {
-  const form = await c.req.formData().catch(() => {
-    throw new BadRequest("multipart/form-data で送ってほしい");
-  });
+app.openapi(createJobRoute, async (c) => {
+  const form = c.req.valid("form");
   const job = await createJob();
   try {
-    enqueue(job.id, await parseInput(form, job.id));
+    enqueue(job.id, await saveInput(form, job.id));
   } catch (e) {
     // 検証エラーはジョブを failed にして理由を残し、400 を返す
     await writeRecord({
@@ -111,26 +113,34 @@ app.post("/jobs", async (c) => {
   return c.json({ id: job.id, status: job.status }, 202);
 });
 
-app.get("/jobs/:id", async (c) => {
-  const id = c.req.param("id");
-  if (!isJobId(id)) return c.json({ error: "不正な job id" }, 400);
+app.openapi(getJobRoute, async (c) => {
+  const { id } = c.req.valid("param");
   const record = await readRecord(id);
   if (!record) return c.json({ error: "ジョブが見つからない" }, 404);
-  return c.json({ ...record, ...(await readProgress(id)) });
+  const p = await readProgress(id);
+  return c.json(
+    { ...record, ...p, logTail: [...p.logTail], readyPages: [...p.readyPages] },
+    200,
+  );
 });
 
-app.get("/jobs/:id/pages/:n", async (c) => {
-  const id = c.req.param("id");
-  const n = Number(c.req.param("n"));
-  if (!isJobId(id) || !Number.isInteger(n) || n < 1) {
-    return c.json({ error: "不正なパラメータ" }, 400);
-  }
+app.openapi(getPageRoute, async (c) => {
+  const { id, n } = c.req.valid("param");
   const file = await pageFile(id, n);
   if (!file) return c.json({ error: "そのページはまだ無い" }, 404);
-  return new Response(await readFile(file), {
-    headers: { "content-type": "image/png" },
-  });
+  return c.body(await readFile(file), 200, { "content-type": "image/png" }) as never;
 });
+
+app.doc("/openapi.json", {
+  openapi: "3.0.3",
+  info: {
+    title: "manga-forge local API",
+    version: "0.1.0",
+    description:
+      "OMNY（漫画ネームYAML）から完成原稿PNGを生成するローカル専用API（127.0.0.1 のみ）",
+  },
+});
+app.get("/docs", swaggerUI({ url: "/openapi.json" }));
 
 app.onError((e, c) => {
   if (e instanceof BadRequest) return c.json({ error: e.message }, 400);
@@ -141,5 +151,5 @@ app.onError((e, c) => {
 await mkdir(OUT_ROOT, { recursive: true });
 await failStaleJobs();
 serve({ fetch: app.fetch, hostname: HOST, port: PORT }, (i) =>
-  console.log(`manga-forge-server: http://${HOST}:${i.port}`),
+  console.log(`manga-forge-server: http://${HOST}:${i.port}  (docs: /docs)`),
 );
